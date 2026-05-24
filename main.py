@@ -43,6 +43,13 @@ office = {
 }
 
 # =========================
+# TEMP SCROLL STATE (NEW)
+# =========================
+temp_scroll_active = False
+temp_scroll_x = WIDTH
+last_c_press = 0
+
+# =========================
 # WIFI
 # =========================
 def connect_wifi():
@@ -178,7 +185,19 @@ def draw_section_1(frame):
 
 
 # =========================
-# CAT (ORIGINAL)
+# TEMP SCROLL RENDER (NEW)
+# =========================
+def draw_temp_scroll(x):
+
+    temp = office.get("temperature", 0)
+    text = "TEMP: {}C".format(temp)
+
+    graphics.set_pen(graphics.create_pen(255, 255, 255))
+    graphics.text(text, x, 2, scale=1)
+
+
+# =========================
+# CAT
 # =========================
 cat_x = -8
 cat_active = False
@@ -196,25 +215,20 @@ def draw_cat(x, frame):
 
     graphics.set_pen(graphics.create_pen(220, 220, 220))
 
-    # Body
     for px in range(1, 6):
         for py in range(4, 7):
             safe_pixel(x + px, py)
 
-    # Head
     for px in range(5, 8):
         for py in range(3, 6):
             safe_pixel(x + px, py)
 
-    # Ears
     safe_pixel(x + 5, 2)
     safe_pixel(x + 7, 2)
 
-    # Tail
     safe_pixel(x, 3)
     safe_pixel(x, 4)
 
-    # Legs
     if frame == 0:
         safe_pixel(x + 2, 7)
         safe_pixel(x + 5, 6)
@@ -224,7 +238,7 @@ def draw_cat(x, frame):
 
 
 # =========================
-# PERSON (NEW)
+# PERSON
 # =========================
 person_state = "IDLE"
 person_y = HEIGHT
@@ -235,51 +249,35 @@ def draw_person(x, y):
 
     graphics.set_pen(graphics.create_pen(255, 255, 255))
 
-    # =========================
-    # HEAD (solid block)
-    # =========================
     for px in range(1, 4):
         for py in range(0, 3):
             safe_pixel(x + px, y + py)
 
-    # =========================
-    # BODY (solid torso)
-    # =========================
     for px in range(1, 4):
         for py in range(3, 7):
             safe_pixel(x + px, y + py)
 
-    # =========================
-    # ARMS (thicker silhouette arms)
-    # =========================
     for py in range(3, 6):
         safe_pixel(x, y + py)
         safe_pixel(x + 4, y + py)
 
-    # shoulders fill
     safe_pixel(x, y + 3)
     safe_pixel(x + 4, y + 3)
 
-    # =========================
-    # LEGS (walking stance silhouette)
-    # =========================
     if (time.ticks_ms() // 200) % 2 == 0:
 
-        # left forward, right back
         safe_pixel(x + 1, y + 7)
         safe_pixel(x + 2, y + 7)
         safe_pixel(x + 3, y + 7)
-
         safe_pixel(x + 1, y + 8)
 
     else:
 
-        # right forward, left back
         safe_pixel(x + 1, y + 7)
         safe_pixel(x + 2, y + 7)
         safe_pixel(x + 3, y + 7)
-
         safe_pixel(x + 3, y + 8)
+
 
 # =========================
 # STARTUP
@@ -298,13 +296,14 @@ counter = 0
 
 while True:
 
-    # MQTT
     try:
         if client:
             client.check_msg()
     except Exception as e:
         print("[MQTT ERROR]", e)
         reconnect_mqtt()
+
+    now = time.ticks_ms()
 
     # -------------------------
     # CAT TRIGGER (A)
@@ -317,12 +316,19 @@ while True:
     # -------------------------
     # PERSON TRIGGER (B)
     # -------------------------
-    now = time.ticks_ms()
-
     if galactic.is_pressed(GalacticUnicorn.SWITCH_B):
         if person_state == "IDLE":
             person_state = "UP"
             person_y = HEIGHT
+
+    # -------------------------
+    # TEMP SCROLL TRIGGER (C) NEW
+    # -------------------------
+    if galactic.is_pressed(GalacticUnicorn.SWITCH_C):
+        if time.ticks_diff(now, last_c_press) > 300:
+            temp_scroll_active = True
+            temp_scroll_x = WIDTH
+            last_c_press = now
 
     # -------------------------
     # PERSON STATE MACHINE
@@ -336,12 +342,10 @@ while True:
             person_state = "HOLD"
             person_start_time = now
 
-
     elif person_state == "HOLD":
 
         if time.ticks_diff(now, person_start_time) > 10000:
             person_state = "DOWN"
-
 
     elif person_state == "DOWN":
 
@@ -350,6 +354,15 @@ while True:
         if person_y > HEIGHT:
             person_state = "IDLE"
 
+    # -------------------------
+    # TEMP SCROLL UPDATE
+    # -------------------------
+    if temp_scroll_active:
+
+        temp_scroll_x -= 1
+
+        if temp_scroll_x < -80:
+            temp_scroll_active = False
 
     # -------------------------
     # DRAW
@@ -357,11 +370,9 @@ while True:
     draw_background()
     draw_section_1(frame)
 
-    # PERSON
     if person_state != "IDLE":
         draw_person(2, person_y)
 
-    # CAT
     if cat_active:
 
         draw_cat(cat_x, cat_frame)
@@ -373,6 +384,10 @@ while True:
 
         if cat_x > WIDTH:
             cat_active = False
+
+    # TEMP SCROLL DRAW (NEW)
+    if temp_scroll_active:
+        draw_temp_scroll(temp_scroll_x)
 
     # BRIGHTNESS
     if galactic.is_pressed(GalacticUnicorn.SWITCH_BRIGHTNESS_UP):
@@ -386,7 +401,6 @@ while True:
 
     galactic.update(graphics)
 
-    # DEBUG
     counter += 1
     if counter % 200 == 0:
         print("[RUNNING]", office)
@@ -394,4 +408,3 @@ while True:
     frame = 1 - frame
 
     time.sleep(0.05)
-
