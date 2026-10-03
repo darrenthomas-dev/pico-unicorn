@@ -1,5 +1,6 @@
 import time
 import json
+import random
 import network
 import config
 
@@ -39,7 +40,8 @@ section_width = WIDTH // 4
 office = {
     "temperature": 22,
     "humidity": 50,
-    "co2": 600
+    "co2": 600,
+    "rain": 0
 }
 
 # =========================
@@ -199,6 +201,78 @@ def draw_temp_scroll(x):
 
 
 # =========================
+# RAIN
+# =========================
+RAIN_MAX_DROPS = 20
+
+# each drop: [x, y, speed, active]
+rain_drops = [[0, 0, 1, False] for _ in range(RAIN_MAX_DROPS)]
+last_rain_move = 0
+rain_preview_until = 0
+last_d_press = 0
+
+
+def rain_intensity(now):
+
+    try:
+        r = float(office.get("rain", 0))
+    except Exception:
+        r = 0.0
+
+    # Button D preview
+    if time.ticks_diff(rain_preview_until, now) > 0:
+        r = max(r, 0.6)
+
+    return max(0.0, min(r, 1.0))
+
+
+def update_rain(now):
+
+    global last_rain_move
+
+    if time.ticks_diff(now, last_rain_move) < 80:
+        return
+
+    last_rain_move = now
+
+    intensity = rain_intensity(now)
+    target = int(intensity * RAIN_MAX_DROPS)
+    active = sum(1 for d in rain_drops if d[3])
+
+    for d in rain_drops:
+
+        if d[3]:
+            d[1] += d[2]
+
+            if d[1] >= HEIGHT:
+                d[3] = False
+                active -= 1
+
+        # only spawn while raining, so drops on screen finish when it stops
+        elif active < target and random.randint(0, 3) == 0:
+            d[0] = random.randint(0, WIDTH - 1)
+            d[1] = -random.randint(0, 3)
+            d[2] = 2 if intensity > 0.6 and random.randint(0, 1) else 1
+            d[3] = True
+            active += 1
+
+
+def draw_rain():
+
+    tail = graphics.create_pen(60, 70, 110)
+    head = graphics.create_pen(180, 200, 255)
+
+    for d in rain_drops:
+
+        if d[3]:
+            graphics.set_pen(tail)
+            safe_pixel(d[0], d[1] - 1)
+
+            graphics.set_pen(head)
+            safe_pixel(d[0], d[1])
+
+
+# =========================
 # CAT
 # =========================
 cat_x = -8
@@ -333,6 +407,14 @@ while True:
             last_c_press = now
 
     # -------------------------
+    # RAIN PREVIEW TRIGGER (D)
+    # -------------------------
+    if galactic.is_pressed(GalacticUnicorn.SWITCH_D):
+        if time.ticks_diff(now, last_d_press) > 300:
+            rain_preview_until = time.ticks_add(now, 10000)
+            last_d_press = now
+
+    # -------------------------
     # PERSON STATE MACHINE
     # -------------------------
     if person_state == "UP":
@@ -367,10 +449,16 @@ while True:
             temp_scroll_active = False
 
     # -------------------------
+    # RAIN UPDATE
+    # -------------------------
+    update_rain(now)
+
+    # -------------------------
     # DRAW
     # -------------------------
     draw_background()
     draw_section_1(frame)
+    draw_rain()
 
     if person_state != "IDLE":
         draw_person(2, person_y)
