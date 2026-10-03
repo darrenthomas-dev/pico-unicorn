@@ -37,9 +37,9 @@ section_width = WIDTH // 4
 # SENSOR STATE
 # =========================
 office = {
-    "temperature": 0,
-    "humidity": 0,
-    "co2": 0
+    "temperature": 22,
+    "humidity": 50,
+    "co2": 600
 }
 
 # =========================
