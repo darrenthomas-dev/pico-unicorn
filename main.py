@@ -81,10 +81,12 @@ def connect_wifi():
 # =========================
 def mqtt_callback(topic, msg):
 
-    global office
-
     try:
-        office = json.loads(msg)
+        data = json.loads(msg)
+        # Merge so keys missing from this message keep their last value
+        for key in office:
+            if key in data:
+                office[key] = data[key]
         print("[MQTT]", office)
 
     except Exception as e:
