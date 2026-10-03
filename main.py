@@ -17,6 +17,8 @@ WIFI_PASS = config.WIFI_PASS
 MQTT_BROKER = config.MQTT_BROKER
 MQTT_PORT = config.MQTT_PORT
 TOPIC = config.MQTT_TOPIC
+ALERT_TOPIC = getattr(config, "MQTT_ALERT_TOPIC", "unicorn/alert")
+ALERT_TIMEOUT_MS = getattr(config, "ALERT_TIMEOUT_MIN", 30) * 60 * 1000
 
 CLIENT_ID = "unicorn_" + str(time.ticks_ms())
 
@@ -79,9 +81,162 @@ def connect_wifi():
 
 
 # =========================
+# UPTIME KUMA ALERTS
+# =========================
+# site -> {"last": ticks_ms of last message, "silenced": bool}
+alerts = {}
+alert_scroll_x = WIDTH
+alert_was_showing = False
+
+
+def ascii_only(text):
+
+    return "".join(c for c in text if ord(c) < 128).strip()
+
+
+def domain_from_url(url):
+
+    if not url or "://" not in url:
+        return None
+
+    host = url.split("://", 1)[1]
+    host = host.split("/", 1)[0].split(":", 1)[0]
+
+    return host or None
+
+
+def parse_alert(msg):
+
+    # Returns (site, is_down), or None if the message isn't understood
+    text = msg.decode() if isinstance(msg, bytes) else msg
+
+    # JSON: {"monitor": {"name", "url"}, "heartbeat": {"status"}, "msg"}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+
+    if isinstance(data, dict):
+        monitor = data.get("monitor") or {}
+        heartbeat = data.get("heartbeat") or {}
+
+        site = domain_from_url(monitor.get("url")) or monitor.get("name")
+        status = heartbeat.get("status")
+
+        if site and status in (0, 1):
+            return ascii_only(site), status == 0
+
+        text = data.get("msg") or ""
+
+    # Text: "[name] [Down] reason" or "Monitor #6 'name': Failing ..."
+    site = None
+    status_text = text
+
+    parts = text.split("[")
+    brackets = [p.split("]", 1)[0] for p in parts[1:] if "]" in p]
+
+    if text.count("'") >= 2:
+        site = text.split("'")[1]
+
+    elif brackets:
+        site = brackets[0]
+        if len(brackets) > 1:
+            status_text = brackets[1]
+
+    if not site:
+        return None
+
+    lower = status_text.lower()
+
+    if "down" in lower or "fail" in lower:
+        return ascii_only(site), True
+
+    if "up" in lower or "success" in lower:
+        return ascii_only(site), False
+
+    return None
+
+
+def handle_alert(msg):
+
+    result = parse_alert(msg)
+
+    if result is None:
+        print("[ALERT] unrecognised:", msg)
+        return
+
+    site, is_down = result
+    now = time.ticks_ms()
+
+    if is_down:
+        # repeat "down" messages keep an existing silence
+        entry = alerts.get(site, {"silenced": False})
+        entry["last"] = now
+        alerts[site] = entry
+        print("[ALERT] DOWN", site)
+
+    elif site in alerts:
+        del alerts[site]
+        print("[ALERT] UP", site)
+
+
+def expire_alerts(now):
+
+    for site in list(alerts):
+        if time.ticks_diff(now, alerts[site]["last"]) > ALERT_TIMEOUT_MS:
+            del alerts[site]
+            print("[ALERT] timed out", site)
+
+
+def silence_alerts():
+
+    for entry in alerts.values():
+        entry["silenced"] = True
+
+    print("[ALERT] silenced")
+
+
+def visible_alerts():
+
+    return [site for site in alerts if not alerts[site]["silenced"]]
+
+
+def draw_alert(now, sites):
+
+    global alert_scroll_x
+
+    # slow red pulse, 120..220
+    level = 120 + abs(((now // 20) % 100) - 50) * 2
+
+    graphics.set_pen(graphics.create_pen(level, 0, 0))
+    graphics.clear()
+
+    text = "  |  ".join(sites)
+    text_width = graphics.measure_text(text, scale=1)
+
+    graphics.set_pen(graphics.create_pen(255, 255, 255))
+    graphics.text(text, alert_scroll_x, 2, scale=1)
+
+    alert_scroll_x -= 1
+
+    if alert_scroll_x < -text_width:
+        alert_scroll_x = WIDTH
+
+
+# =========================
 # MQTT CALLBACK
 # =========================
 def mqtt_callback(topic, msg):
+
+    if isinstance(topic, bytes):
+        topic = topic.decode()
+
+    if topic == ALERT_TOPIC:
+        try:
+            handle_alert(msg)
+        except Exception as e:
+            print("[ALERT ERROR]", e)
+        return
 
     try:
         data = json.loads(msg)
@@ -117,6 +272,7 @@ def connect_mqtt():
 
         client.connect()
         client.subscribe(TOPIC)
+        client.subscribe(ALERT_TOPIC)
 
         print("[MQTT] connected")
 
@@ -209,7 +365,6 @@ RAIN_MAX_DROPS = 20
 rain_drops = [[0, 0, 1, False] for _ in range(RAIN_MAX_DROPS)]
 last_rain_move = 0
 rain_preview_until = 0
-last_d_press = 0
 
 
 def rain_intensity(now):
@@ -369,6 +524,8 @@ if connect_wifi():
 # =========================
 frame = 0
 counter = 0
+d_press_start = None
+d_long_fired = False
 
 while True:
 
@@ -407,12 +564,24 @@ while True:
             last_c_press = now
 
     # -------------------------
-    # RAIN PREVIEW TRIGGER (D)
+    # BUTTON D: tap = rain preview, hold 2s = silence alerts
     # -------------------------
     if galactic.is_pressed(GalacticUnicorn.SWITCH_D):
-        if time.ticks_diff(now, last_d_press) > 300:
+
+        if d_press_start is None:
+            d_press_start = now
+            d_long_fired = False
+
+        elif not d_long_fired and time.ticks_diff(now, d_press_start) >= 2000:
+            silence_alerts()
+            d_long_fired = True
+
+    elif d_press_start is not None:
+
+        if not d_long_fired:
             rain_preview_until = time.ticks_add(now, 10000)
-            last_d_press = now
+
+        d_press_start = None
 
     # -------------------------
     # PERSON STATE MACHINE
@@ -454,30 +623,44 @@ while True:
     update_rain(now)
 
     # -------------------------
+    # ALERTS
+    # -------------------------
+    expire_alerts(now)
+    down_sites = visible_alerts()
+
+    if down_sites and not alert_was_showing:
+        alert_scroll_x = WIDTH
+
+    alert_was_showing = bool(down_sites)
+
+    # -------------------------
     # DRAW
     # -------------------------
-    draw_background()
-    draw_section_1(frame)
-    draw_rain()
+    if down_sites:
+        draw_alert(now, down_sites)
+    else:
+        draw_background()
+        draw_section_1(frame)
+        draw_rain()
 
-    if person_state != "IDLE":
-        draw_person(2, person_y)
+        if person_state != "IDLE":
+            draw_person(2, person_y)
 
-    if cat_active:
+        if cat_active:
 
-        draw_cat(cat_x, cat_frame)
+            draw_cat(cat_x, cat_frame)
 
-        if time.ticks_diff(now, last_cat_move) > 120:
-            last_cat_move = now
-            cat_x += 1
-            cat_frame = 1 - cat_frame
+            if time.ticks_diff(now, last_cat_move) > 120:
+                last_cat_move = now
+                cat_x += 1
+                cat_frame = 1 - cat_frame
 
-        if cat_x > WIDTH:
-            cat_active = False
+            if cat_x > WIDTH:
+                cat_active = False
 
-    # TEMP SCROLL DRAW (NEW)
-    if temp_scroll_active:
-        draw_temp_scroll(temp_scroll_x)
+        # TEMP SCROLL DRAW (NEW)
+        if temp_scroll_active:
+            draw_temp_scroll(temp_scroll_x)
 
     # BRIGHTNESS
     if galactic.is_pressed(GalacticUnicorn.SWITCH_BRIGHTNESS_UP):
