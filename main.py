@@ -38,6 +38,11 @@ UTC_OFFSET_HOURS = getattr(config, "UTC_OFFSET_HOURS", 0)     # used until weath
 CLOCK_24H = getattr(config, "CLOCK_24H", True)
 PAGE_SECONDS = getattr(config, "PAGE_SECONDS", 6)
 
+# Night dimming (local time, 24h). Set both hours the same to turn it off.
+NIGHT_START_HOUR = getattr(config, "NIGHT_START_HOUR", 22)
+NIGHT_END_HOUR = getattr(config, "NIGHT_END_HOUR", 7)
+NIGHT_BRIGHTNESS = getattr(config, "NIGHT_BRIGHTNESS", 0.05)
+
 # =========================
 # DISPLAY
 # =========================
@@ -48,6 +53,7 @@ WIDTH = GalacticUnicorn.WIDTH
 HEIGHT = GalacticUnicorn.HEIGHT
 
 brightness = 0.35
+night_brightness = NIGHT_BRIGHTNESS
 galactic.set_brightness(brightness)
 
 # =========================
@@ -593,6 +599,21 @@ def local_time():
     return time.localtime(time.time() + utc_offset)
 
 
+def is_night():
+
+    # Needs the real time, so stays in day mode until NTP has synced
+    if not clock_synced or NIGHT_START_HOUR == NIGHT_END_HOUR:
+        return False
+
+    hour = local_time()[3]
+
+    if NIGHT_START_HOUR > NIGHT_END_HOUR:
+        # crosses midnight, e.g. 22 -> 7
+        return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
+
+    return NIGHT_START_HOUR <= hour < NIGHT_END_HOUR
+
+
 # -------------------------
 # WEATHER (Open-Meteo, no API key needed)
 # -------------------------
@@ -1062,14 +1083,21 @@ while True:
             next_alert()
 
     # BRIGHTNESS
+    # Day and night have their own levels; the buttons adjust whichever
+    # one is active right now.
+    step = 0
     if galactic.is_pressed(GalacticUnicorn.SWITCH_BRIGHTNESS_UP):
-        brightness += 0.02
+        step = 0.02 if not is_night() else 0.01
 
     if galactic.is_pressed(GalacticUnicorn.SWITCH_BRIGHTNESS_DOWN):
-        brightness -= 0.02
+        step = -0.02 if not is_night() else -0.01
 
-    brightness = max(min(brightness, 1.0), 0.1)
-    galactic.set_brightness(brightness)
+    if is_night():
+        night_brightness = max(min(night_brightness + step, 1.0), 0.01)
+        galactic.set_brightness(night_brightness)
+    else:
+        brightness = max(min(brightness + step, 1.0), 0.1)
+        galactic.set_brightness(brightness)
 
     galactic.update(graphics)
 

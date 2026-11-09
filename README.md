@@ -27,7 +27,12 @@ WEATHER_POLL_MINUTES = 15        # optional
 CLOCK_24H = True                 # optional
 PAGE_SECONDS = 6                 # optional
 UTC_OFFSET_HOURS = 0             # optional, only used if weather isn't set up
+NIGHT_START_HOUR = 22            # optional, dim the display from 22:00...
+NIGHT_END_HOUR = 7               # ...until 07:00 (same value = never dim)
+NIGHT_BRIGHTNESS = 0.05          # optional
 ```
+
+At night the whole display (including any Uptime Kuma alert) drops to `NIGHT_BRIGHTNESS`. The brightness buttons adjust the night level while it's night and the day level during the day.
 
 Buttons: **A** walks a cat across, **B** shows a little person, **C** scrolls the office temperature, and the brightness buttons work as usual.
 ## Uptime Kuma alerts
