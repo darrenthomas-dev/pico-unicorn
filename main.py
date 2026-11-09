@@ -2,6 +2,7 @@ import time
 import json
 import gc
 import network
+import ntptime
 import ubinascii
 import urequests
 import config
@@ -28,6 +29,15 @@ KUMA_API_KEY = getattr(config, "KUMA_API_KEY", "")
 KUMA_POLL_SECONDS = getattr(config, "KUMA_POLL_SECONDS", 30)
 KUMA_UP_REPEATS = getattr(config, "KUMA_UP_REPEATS", 2)
 
+# Weather clock idle screen. Weather pages are skipped if no location is set.
+WEATHER_LAT = getattr(config, "WEATHER_LAT", None)
+WEATHER_LON = getattr(config, "WEATHER_LON", None)
+WEATHER_UNITS = getattr(config, "WEATHER_UNITS", "celsius")   # or "fahrenheit"
+WEATHER_POLL_MINUTES = getattr(config, "WEATHER_POLL_MINUTES", 15)
+UTC_OFFSET_HOURS = getattr(config, "UTC_OFFSET_HOURS", 0)     # used until weather loads
+CLOCK_24H = getattr(config, "CLOCK_24H", True)
+PAGE_SECONDS = getattr(config, "PAGE_SECONDS", 6)
+
 # =========================
 # DISPLAY
 # =========================
@@ -40,8 +50,6 @@ HEIGHT = GalacticUnicorn.HEIGHT
 brightness = 0.35
 galactic.set_brightness(brightness)
 
-section_width = WIDTH // 4
-
 # =========================
 # SENSOR STATE
 # =========================
@@ -50,6 +58,7 @@ office = {
     "humidity": 0,
     "co2": 0
 }
+office_updated = False
 
 # =========================
 # TEMP SCROLL STATE (NEW)
@@ -90,10 +99,11 @@ def connect_wifi():
 # =========================
 def mqtt_callback(topic, msg):
 
-    global office
+    global office, office_updated
 
     try:
         office = json.loads(msg)
+        office_updated = True
         print("[MQTT]", office)
 
     except Exception as e:
@@ -325,30 +335,403 @@ def draw_alert():
 
 
 # =========================
-# BACKGROUND
+# IDLE SCREEN: WEATHER CLOCK
 # =========================
-def draw_background():
+# Rotates through simplified pages that fit the 53x11 display:
+#   CLOCK     12:47  FRI / 13-08
+#   WEATHER   icon, big temperature, today's high / low
+#   FORECAST  next 3 days: icon, day, high
+#   OFFICE    MQTT readings with the comfort colour bar (if data received)
 
-    graphics.set_pen(graphics.create_pen(0, 0, 0))
-    graphics.clear()
+# Tiny pixel font. Every glyph is 5 rows; widths vary.
+FONT = {
+    "0": ("###", "#.#", "#.#", "#.#", "###"),
+    "1": (".#.", "##.", ".#.", ".#.", "###"),
+    "2": ("###", "..#", "###", "#..", "###"),
+    "3": ("###", "..#", ".##", "..#", "###"),
+    "4": ("#.#", "#.#", "###", "..#", "..#"),
+    "5": ("###", "#..", "###", "..#", "###"),
+    "6": ("###", "#..", "###", "#.#", "###"),
+    "7": ("###", "..#", "..#", ".#.", ".#."),
+    "8": ("###", "#.#", "###", "#.#", "###"),
+    "9": ("###", "#.#", "###", "..#", "###"),
+    "A": (".#.", "#.#", "###", "#.#", "#.#"),
+    "C": (".##", "#..", "#..", "#..", ".##"),
+    "E": ("###", "#..", "##.", "#..", "###"),
+    "F": ("###", "#..", "##.", "#..", "#.."),
+    "H": ("#.#", "#.#", "###", "#.#", "#.#"),
+    "I": ("###", ".#.", ".#.", ".#.", "###"),
+    "M": ("#.#", "###", "###", "#.#", "#.#"),
+    "N": ("##.", "#.#", "#.#", "#.#", "#.#"),
+    "O": (".#.", "#.#", "#.#", "#.#", ".#."),
+    "R": ("##.", "#.#", "##.", "#.#", "#.#"),
+    "S": (".##", "#..", ".#.", "..#", "##."),
+    "T": ("###", ".#.", ".#.", ".#.", ".#."),
+    "U": ("#.#", "#.#", "#.#", "#.#", "###"),
+    "W": ("#.#", "#.#", "###", "###", "#.#"),
+    ":": (".", "#", ".", "#", "."),
+    "-": ("...", "...", "###", "...", "..."),
+    "%": ("#.#", "..#", ".#.", "#..", "#.#"),
+    "°": ("##", "##", "..", "..", ".."),
+    " ": ("..", "..", "..", "..", ".."),
+}
 
-    graphics.set_pen(graphics.create_pen(30, 0, 0))
-    graphics.rectangle(0, 0, section_width, HEIGHT)
-
-    graphics.set_pen(graphics.create_pen(0, 30, 0))
-    graphics.rectangle(section_width, 0, section_width, HEIGHT)
-
-    graphics.set_pen(graphics.create_pen(0, 0, 30))
-    graphics.rectangle(section_width * 2, 0, section_width, HEIGHT)
-
-    graphics.set_pen(graphics.create_pen(30, 0, 30))
-    graphics.rectangle(section_width * 3, 0, WIDTH - section_width * 3, HEIGHT)
+DAY_NAMES = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 
 
-# =========================
-# SECTION 1
-# =========================
-def draw_section_1(frame):
+def text_width(text, scale=1):
+
+    w = 0
+    for ch in text:
+        w += len(FONT.get(ch, FONT[" "])[0]) * scale + 1
+    return max(w - 1, 0)
+
+
+def draw_small(text, x, y, pen, scale=1):
+
+    graphics.set_pen(pen)
+
+    for ch in text:
+        glyph = FONT.get(ch, FONT[" "])
+        for row, bits in enumerate(glyph):
+            for col, bit in enumerate(bits):
+                if bit == "#":
+                    graphics.rectangle(x + col * scale, y + row * scale, scale, scale)
+        x += len(glyph[0]) * scale + 1
+
+    return x
+
+
+# Pixel-art icons. Each letter is a colour from ICON_COLOURS, "." is empty.
+ICONS = {
+    "sun": (
+        ".....Y.....",
+        ".Y.......Y.",
+        "....YYY....",
+        "...YYYYY...",
+        "..YYYYYYY..",
+        "Y.YYYYYYO.Y",
+        "..YYYYYOO..",
+        "...YYOOO...",
+        "....OOO....",
+        ".Y.......Y.",
+        ".....Y.....",
+    ),
+    "moon": (
+        "...........",
+        "...MMMM....",
+        "..MMM...W..",
+        ".MMM.......",
+        ".MMM.......",
+        ".MMM...W...",
+        ".MMM.......",
+        "..MMM....W.",
+        "...MMMM....",
+        "...........",
+        "...........",
+    ),
+    "partly": (
+        "...Y.......",
+        ".Y...Y.....",
+        "...YYY.....",
+        "Y.YYYYY....",
+        "..YYYWWW...",
+        ".Y.YWWWWWW.",
+        "...WWWWWWWW",
+        "..WWWWWWWWW",
+        "...GGGGGGG.",
+        "...........",
+        "...........",
+    ),
+    "cloud": (
+        "...........",
+        "...........",
+        "...........",
+        "....WWW....",
+        "...WWWWWW..",
+        ".WWWWWWWWW.",
+        "WWWWWWWWWWW",
+        "WWWWWWWWWWW",
+        ".GGGGGGGGG.",
+        "...........",
+        "...........",
+    ),
+    "rain": (
+        "...........",
+        "....WWW....",
+        "...WWWWWW..",
+        ".WWWWWWWWW.",
+        "WWWWWWWWWWW",
+        ".GGGGGGGGG.",
+        "...........",
+        "..B...B....",
+        ".B...B...B.",
+        "....B...B..",
+        "...B...B...",
+    ),
+    "snow": (
+        "...........",
+        "....WWW....",
+        "...WWWWWW..",
+        ".WWWWWWWWW.",
+        "WWWWWWWWWWW",
+        ".GGGGGGGGG.",
+        "...........",
+        "..C....C...",
+        "....C....C.",
+        ".C.........",
+        "......C....",
+    ),
+    "storm": (
+        "...........",
+        "....GGG....",
+        "...GGGGGG..",
+        ".GGGGGGGGG.",
+        "GGGGGGGGGGG",
+        ".DDDDDDDDD.",
+        ".....YY....",
+        ".B..YY...B.",
+        "...YYYY....",
+        "B....YY..B.",
+        "....Y......",
+    ),
+    "fog": (
+        "...........",
+        "...........",
+        ".GGGGGGGG..",
+        "...........",
+        "..WWWWWWWWW",
+        "...........",
+        "GGGGGGGG...",
+        "...........",
+        "..WWWWWWWW.",
+        "...........",
+        "...........",
+    ),
+}
+
+SMALL_ICONS = {
+    "sun":    ("..Y..", ".YYY.", "YYYYO", ".YOO.", "..O.."),
+    "partly": ("..Y..", "YYY..", "YYWW.", ".WWWW", "WWWWW"),
+    "cloud":  (".....", "..WW.", ".WWWW", "WWWWW", ".GGGG"),
+    "rain":   (".WWW.", "WWWWW", "GGGGG", ".B.B.", "B.B.."),
+    "snow":   (".WWW.", "WWWWW", "GGGGG", ".C.C.", "C...C"),
+    "storm":  (".GGG.", "GGGGG", ".YY..", "..YY.", ".Y..."),
+    "fog":    ("GGGG.", ".....", ".GGGG", ".....", "GGGG."),
+}
+
+ICON_COLOURS = {
+    "Y": graphics.create_pen(255, 200, 0),
+    "O": graphics.create_pen(255, 120, 0),
+    "M": graphics.create_pen(230, 220, 150),
+    "W": graphics.create_pen(200, 200, 215),
+    "G": graphics.create_pen(110, 110, 125),
+    "D": graphics.create_pen(60, 60, 70),
+    "B": graphics.create_pen(60, 140, 255),
+    "C": graphics.create_pen(220, 240, 255),
+}
+
+PEN_BLACK = graphics.create_pen(0, 0, 0)
+PEN_WHITE = graphics.create_pen(255, 255, 255)
+PEN_GREY = graphics.create_pen(120, 120, 120)
+PEN_DAY = graphics.create_pen(200, 80, 220)
+PEN_HIGH = graphics.create_pen(255, 170, 60)
+PEN_LOW = graphics.create_pen(60, 150, 255)
+
+
+def draw_icon(icon, x, y):
+
+    for row, line in enumerate(icon):
+        for col, ch in enumerate(line):
+            if ch != ".":
+                graphics.set_pen(ICON_COLOURS[ch])
+                safe_pixel(x + col, y + row)
+
+
+def icon_name(code, is_day=1):
+
+    # WMO weather codes, as used by Open-Meteo
+    if code == 0:
+        return "sun" if is_day else "moon"
+    if code in (1, 2):
+        return "partly" if is_day else "cloud"
+    if code in (45, 48):
+        return "fog"
+    if 51 <= code <= 67 or 80 <= code <= 82:
+        return "rain"
+    if 71 <= code <= 77 or code in (85, 86):
+        return "snow"
+    if code >= 95:
+        return "storm"
+    return "cloud"
+
+
+# -------------------------
+# CLOCK (NTP)
+# -------------------------
+clock_synced = False
+utc_offset = int(UTC_OFFSET_HOURS * 3600)   # replaced by Open-Meteo's offset
+last_ntp_sync = 0
+
+
+def sync_clock():
+
+    global clock_synced, last_ntp_sync
+
+    last_ntp_sync = time.ticks_ms()
+
+    try:
+        ntptime.settime()
+        clock_synced = True
+        print("[NTP] synced")
+    except Exception as e:
+        print("[NTP ERROR]", e)
+
+
+def local_time():
+
+    return time.localtime(time.time() + utc_offset)
+
+
+# -------------------------
+# WEATHER (Open-Meteo, no API key needed)
+# -------------------------
+weather = None
+last_weather_poll = 0
+
+
+def fetch_weather():
+
+    global weather, utc_offset, last_weather_poll
+
+    last_weather_poll = time.ticks_ms()
+
+    if WEATHER_LAT is None or WEATHER_LON is None:
+        return
+
+    gc.collect()
+    r = None
+
+    try:
+        r = urequests.get(
+            "https://api.open-meteo.com/v1/forecast"
+            "?latitude={}&longitude={}"
+            "&current=temperature_2m,weather_code,is_day"
+            "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+            "&timezone=auto&forecast_days=4&temperature_unit={}".format(
+                WEATHER_LAT, WEATHER_LON, WEATHER_UNITS
+            )
+        )
+
+        if r.status_code != 200:
+            print("[WEATHER] HTTP", r.status_code)
+            return
+
+        data = r.json()
+        current = data["current"]
+        daily = data["daily"]
+
+        weather = {
+            "temp": current["temperature_2m"],
+            "code": current["weather_code"],
+            "is_day": current.get("is_day", 1),
+            "codes": daily["weather_code"],
+            "highs": daily["temperature_2m_max"],
+            "lows": daily["temperature_2m_min"],
+        }
+
+        # Handles daylight saving for the configured location
+        utc_offset = data.get("utc_offset_seconds", utc_offset)
+
+        print("[WEATHER]", weather["temp"], weather["code"])
+
+    except Exception as e:
+        print("[WEATHER ERROR]", e)
+
+    finally:
+        if r:
+            r.close()
+        gc.collect()
+
+
+def deg(value):
+
+    return "{}°".format(int(round(value)))
+
+
+# -------------------------
+# PAGES
+# -------------------------
+def draw_clock_page():
+
+    if not clock_synced:
+        draw_small("--:--", 1, 1, PEN_GREY, 2)
+        return
+
+    t = local_time()
+    hour = t[3]
+    if not CLOCK_24H:
+        hour = hour % 12 or 12
+
+    # Big time, colon blinks every second
+    x = draw_small("{:02d}".format(hour), 1, 1, PEN_WHITE, 2)
+    if t[5] % 2 == 0:
+        draw_small(":", x, 1, PEN_WHITE, 2)
+    draw_small("{:02d}".format(t[4]), x + 3, 1, PEN_WHITE, 2)
+
+    # Day on top, date underneath, right aligned
+    day = DAY_NAMES[t[6]]
+    date = "{:02d}-{:02d}".format(t[2], t[1])
+    draw_small(day, WIDTH - 1 - text_width(day), 0, PEN_DAY)
+    draw_small(date, WIDTH - 1 - text_width(date), 6, PEN_GREY)
+
+
+def draw_weather_page():
+
+    now_text = str(int(round(weather["temp"])))
+    high = deg(weather["highs"][0])
+    low = deg(weather["lows"][0])
+
+    # big number with a small degree sign
+    now_w = text_width(now_text, 2) + 1 + text_width("°")
+    hilo_w = max(text_width(high), text_width(low))
+
+    total = 11 + 3 + now_w + 3 + hilo_w
+    show_hilo = total <= WIDTH
+    if not show_hilo:
+        total = 11 + 3 + now_w
+
+    x = (WIDTH - total) // 2
+
+    draw_icon(ICONS[icon_name(weather["code"], weather["is_day"])], x, 0)
+    x += 14
+
+    end = draw_small(now_text, x, 1, PEN_WHITE, 2)
+    draw_small("°", end, 1, PEN_WHITE)
+    x += now_w + 3
+
+    if show_hilo:
+        draw_small(high, x, 0, PEN_HIGH)
+        draw_small(low, x, 6, PEN_LOW)
+
+
+def draw_forecast_page():
+
+    today = local_time()[6]
+
+    for i in range(3):
+
+        day = i + 1
+        if day >= len(weather["codes"]):
+            break
+
+        x = i * 18
+        draw_icon(SMALL_ICONS[icon_name(weather["codes"][day])], x + 1, 3)
+        draw_small(DAY_NAMES[(today + day) % 7], x + 7, 0, PEN_GREY)
+        draw_small(deg(weather["highs"][day]), x + 7, 6, PEN_HIGH)
+
+
+def comfort_colour():
 
     t = office.get("temperature", 22)
     h = office.get("humidity", 50)
@@ -366,16 +749,71 @@ def draw_section_1(frame):
     if c > 1200:
         colour = (255, 0, 0)
 
+    # Slow pulse when it's humid
     pulse = 1.0
     if h > 60:
-        pulse = 0.7 if frame == 0 else 0.3
+        pulse = 0.8 if (time.ticks_ms() // 500) % 2 == 0 else 0.3
 
-    r = int(colour[0] * pulse)
-    g = int(colour[1] * pulse)
-    b = int(colour[2] * pulse)
+    return graphics.create_pen(
+        int(colour[0] * pulse),
+        int(colour[1] * pulse),
+        int(colour[2] * pulse)
+    )
 
-    graphics.set_pen(graphics.create_pen(r, g, b))
-    graphics.rectangle(0, 0, section_width, HEIGHT)
+
+def draw_office_page():
+
+    graphics.set_pen(comfort_colour())
+    graphics.rectangle(0, 0, 2, HEIGHT)
+
+    t = office.get("temperature", 0)
+    h = office.get("humidity", 0)
+    c = office.get("co2", 0)
+
+    draw_small(deg(t) + " " + "{}%".format(int(round(h))), 4, 0, PEN_WHITE)
+
+    if c > 1200:
+        co2_pen = graphics.create_pen(255, 0, 0)
+    elif c > 1000:
+        co2_pen = PEN_HIGH
+    else:
+        co2_pen = PEN_WHITE
+
+    x = draw_small("CO2", 4, 6, PEN_GREY)
+    draw_small(str(int(c)), x + 2, 6, co2_pen)
+
+
+page_index = 0
+page_started = 0
+
+
+def available_pages():
+
+    pages = [draw_clock_page]
+    if weather:
+        pages.append(draw_weather_page)
+        pages.append(draw_forecast_page)
+    if office_updated:
+        pages.append(draw_office_page)
+    return pages
+
+
+def draw_idle():
+
+    global page_index, page_started
+
+    pages = available_pages()
+
+    if time.ticks_diff(time.ticks_ms(), page_started) >= PAGE_SECONDS * 1000:
+        page_started = time.ticks_ms()
+        page_index += 1
+
+    page_index %= len(pages)
+
+    graphics.set_pen(PEN_BLACK)
+    graphics.clear()
+
+    pages[page_index]()
 
 
 # =========================
@@ -385,6 +823,9 @@ def draw_temp_scroll(x):
 
     temp = office.get("temperature", 0)
     text = "TEMP: {}C".format(temp)
+
+    graphics.set_pen(graphics.create_pen(0, 0, 0))
+    graphics.clear()
 
     graphics.set_pen(graphics.create_pen(255, 255, 255))
     graphics.text(text, x, 2, scale=1)
@@ -480,6 +921,8 @@ print("=== BOOT ===")
 
 if connect_wifi():
     connect_mqtt()
+    sync_clock()
+    fetch_weather()
 
 
 # =========================
@@ -513,6 +956,17 @@ while True:
         if alert_mode == "NONE":
             next_alert()
 
+        now = time.ticks_ms()
+
+    # -------------------------
+    # CLOCK + WEATHER REFRESH
+    # -------------------------
+    if time.ticks_diff(now, last_ntp_sync) >= (6 * 3600 * 1000 if clock_synced else 60 * 1000):
+        sync_clock()
+        now = time.ticks_ms()
+
+    if time.ticks_diff(now, last_weather_poll) >= (WEATHER_POLL_MINUTES * 60 * 1000 if weather else 60 * 1000):
+        fetch_weather()
         now = time.ticks_ms()
 
     # -------------------------
@@ -577,8 +1031,7 @@ while True:
     # -------------------------
     # DRAW
     # -------------------------
-    draw_background()
-    draw_section_1(frame)
+    draw_idle()
 
     if person_state != "IDLE":
         draw_person(2, person_y)
