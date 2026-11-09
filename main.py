@@ -1,6 +1,9 @@
 import time
 import json
+import gc
 import network
+import ubinascii
+import urequests
 import config
 
 from umqtt.simple import MQTTClient
@@ -18,6 +21,12 @@ MQTT_PORT = config.MQTT_PORT
 TOPIC = config.MQTT_TOPIC
 
 CLIENT_ID = "unicorn_" + str(time.ticks_ms())
+
+# Uptime Kuma alerts are switched off if KUMA_URL isn't in config.py
+KUMA_URL = getattr(config, "KUMA_URL", "").rstrip("/")
+KUMA_API_KEY = getattr(config, "KUMA_API_KEY", "")
+KUMA_POLL_SECONDS = getattr(config, "KUMA_POLL_SECONDS", 30)
+KUMA_UP_REPEATS = getattr(config, "KUMA_UP_REPEATS", 2)
 
 # =========================
 # DISPLAY
@@ -128,6 +137,191 @@ def reconnect_mqtt():
     print("[MQTT] reconnecting...")
     time.sleep(5)
     connect_mqtt()
+
+
+# =========================
+# UPTIME KUMA
+# =========================
+# Polls Uptime Kuma's /metrics endpoint. While a monitor is down the whole
+# display turns red and scrolls "<domain> DOWN"; when it recovers it turns
+# green and scrolls "<domain> UP" a few times, then the normal display returns.
+
+KUMA_STATUS_DOWN = 0
+KUMA_STATUS_UP = 1
+
+kuma_auth = "Basic " + ubinascii.b2a_base64(
+    (":" + KUMA_API_KEY).encode()
+).decode().strip()
+
+kuma_known = {}          # name -> last status
+kuma_down = []           # names currently down
+kuma_up_queue = []       # names that just recovered, waiting to be shown
+
+alert_mode = "NONE"      # NONE | DOWN | UP
+alert_text = ""
+alert_x = WIDTH
+alert_width = 0
+alert_up_passes = 0
+alert_down_index = 0
+last_kuma_poll = time.ticks_add(time.ticks_ms(), -KUMA_POLL_SECONDS * 1000)
+
+
+def kuma_label(line, name):
+
+    key = name + '="'
+    start = line.find(key)
+    if start < 0:
+        return None
+    start += len(key)
+    end = line.find('"', start)
+    if end < 0:
+        return None
+    value = line[start:end]
+    if value in ("", "null"):
+        return None
+    return value
+
+
+def kuma_display_name(line):
+
+    # Prefer the domain from the URL, then the hostname, then the monitor name
+    url = kuma_label(line, "monitor_url")
+    if url and "://" in url:
+        host = url.split("://", 1)[1].split("/", 1)[0]
+        host = host.split("@")[-1].split(":", 1)[0]
+        if host:
+            return host
+
+    return (kuma_label(line, "monitor_hostname")
+            or kuma_label(line, "monitor_name")
+            or "unknown")
+
+
+def fetch_kuma_statuses():
+
+    # Returns {name: status} or None on failure.
+    # Reads the response a line at a time to save RAM.
+    gc.collect()
+    statuses = {}
+    r = None
+
+    try:
+        r = urequests.get(
+            KUMA_URL + "/metrics",
+            headers={"Authorization": kuma_auth}
+        )
+
+        if r.status_code != 200:
+            print("[KUMA] HTTP", r.status_code)
+            return None
+
+        while True:
+            raw = r.raw.readline()
+            if not raw:
+                break
+            if not raw.startswith(b"monitor_status{"):
+                continue
+
+            line = raw.decode().strip()
+            try:
+                status = int(float(line.rsplit(" ", 1)[1]))
+            except Exception:
+                continue
+
+            statuses[kuma_display_name(line)] = status
+
+        return statuses
+
+    except Exception as e:
+        print("[KUMA ERROR]", e)
+        return None
+
+    finally:
+        if r:
+            r.close()
+        gc.collect()
+
+
+def update_kuma_states(statuses):
+
+    global kuma_known
+
+    first_poll = not kuma_known
+
+    for name, status in statuses.items():
+
+        if status == KUMA_STATUS_DOWN:
+            if name not in kuma_down:
+                kuma_down.append(name)
+                print("[KUMA] DOWN", name)
+            if name in kuma_up_queue:
+                kuma_up_queue.remove(name)
+
+        elif status == KUMA_STATUS_UP:
+            if name in kuma_down:
+                kuma_down.remove(name)
+            # Don't announce everything as "UP" on boot
+            if kuma_known.get(name) == KUMA_STATUS_DOWN and not first_poll:
+                print("[KUMA] UP", name)
+                if name not in kuma_up_queue:
+                    kuma_up_queue.append(name)
+
+        # pending / maintenance: leave the current state alone
+
+    # Deleted / paused monitors shouldn't stay stuck as down
+    for name in list(kuma_down):
+        if name not in statuses:
+            kuma_down.remove(name)
+
+    kuma_known = statuses
+
+
+def start_alert_scroll(text):
+
+    global alert_text, alert_x, alert_width
+
+    alert_text = text
+    alert_x = WIDTH
+    alert_width = graphics.measure_text(text, scale=1)
+
+
+def next_alert():
+
+    # Called when an alert scroll finishes (or when nothing is showing)
+    global alert_mode, alert_up_passes, alert_down_index
+
+    if alert_mode == "UP" and alert_up_passes > 0:
+        alert_up_passes -= 1
+        start_alert_scroll(alert_text)
+        return
+
+    # Recoveries first, so the green shows as soon as something is back
+    if kuma_up_queue:
+        alert_mode = "UP"
+        alert_up_passes = KUMA_UP_REPEATS - 1
+        start_alert_scroll(kuma_up_queue.pop(0) + " UP")
+        return
+
+    if kuma_down:
+        alert_mode = "DOWN"
+        alert_down_index %= len(kuma_down)
+        start_alert_scroll(kuma_down[alert_down_index] + " DOWN")
+        alert_down_index += 1
+        return
+
+    alert_mode = "NONE"
+
+
+def draw_alert():
+
+    if alert_mode == "DOWN":
+        graphics.set_pen(graphics.create_pen(160, 0, 0))
+    else:
+        graphics.set_pen(graphics.create_pen(0, 140, 0))
+    graphics.clear()
+
+    graphics.set_pen(graphics.create_pen(255, 255, 255))
+    graphics.text(alert_text, alert_x, 2, -1, 1)
 
 
 # =========================
@@ -306,6 +500,22 @@ while True:
     now = time.ticks_ms()
 
     # -------------------------
+    # UPTIME KUMA POLL
+    # -------------------------
+    if KUMA_URL and time.ticks_diff(now, last_kuma_poll) >= KUMA_POLL_SECONDS * 1000:
+
+        last_kuma_poll = now
+
+        statuses = fetch_kuma_statuses()
+        if statuses is not None:
+            update_kuma_states(statuses)
+
+        if alert_mode == "NONE":
+            next_alert()
+
+        now = time.ticks_ms()
+
+    # -------------------------
     # CAT TRIGGER (A)
     # -------------------------
     if galactic.is_pressed(GalacticUnicorn.SWITCH_A):
@@ -388,6 +598,15 @@ while True:
     # TEMP SCROLL DRAW (NEW)
     if temp_scroll_active:
         draw_temp_scroll(temp_scroll_x)
+
+    # UPTIME KUMA ALERT (drawn over everything else)
+    if alert_mode != "NONE":
+
+        draw_alert()
+
+        alert_x -= 1
+        if alert_x < -alert_width:
+            next_alert()
 
     # BRIGHTNESS
     if galactic.is_pressed(GalacticUnicorn.SWITCH_BRIGHTNESS_UP):
